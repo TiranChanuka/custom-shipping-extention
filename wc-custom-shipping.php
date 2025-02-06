@@ -12,6 +12,40 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+// Add JavaScript to handle add/remove buttons
+function wc_custom_shipping_admin_scripts()
+{
+    if (
+        isset($_GET['page']) && $_GET['page'] === 'wc-settings'
+        && isset($_GET['tab']) && $_GET['tab'] === 'shipping'
+    ) {
+?>
+        <script type="text/javascript">
+            jQuery(document).ready(function($) {
+                // Handle Add Rate button
+                $(document).on('click', '.add_rate', function() {
+                    var $row = $(this).closest('tr');
+                    var $clone = $row.clone();
+
+                    // Clear values in the cloned row
+                    $clone.find('input').val('');
+                    $clone.find('select').prop('selectedIndex', 0);
+
+                    // Insert before the "new rate" row
+                    $row.before($clone);
+                });
+
+                // Handle Remove Rate button
+                $(document).on('click', '.remove_rate', function() {
+                    $(this).closest('tr').remove();
+                });
+            });
+        </script>
+        <?php
+    }
+}
+add_action('admin_footer', 'wc_custom_shipping_admin_scripts');
+
 // Activation function
 function wc_custom_shipping_activate()
 {
@@ -34,12 +68,10 @@ function wc_custom_shipping_activate()
     dbDelta($sql);
 }
 
-// Register activation hook
 register_activation_hook(__FILE__, 'wc_custom_shipping_activate');
 
 function wc_custom_shipping_init()
 {
-    // Check if WooCommerce is active
     if (!class_exists('WC_Shipping_Method')) {
         return;
     }
@@ -100,7 +132,7 @@ function wc_custom_shipping_init()
 
         public function admin_options()
         {
-?>
+        ?>
             <h2><?php echo esc_html($this->method_title); ?></h2>
             <p><?php echo esc_html($this->method_description); ?></p>
             <table class="form-table">
@@ -172,13 +204,14 @@ function wc_custom_shipping_init()
                             </select>
                         </td>
                         <td><input type="text" name="shipping_rate[new][postal_code]" placeholder="* for all"></td>
-                        <td><input type="number" step="0.01" name="shipping_rate[new][min_weight]" value="0"></td>
-                        <td><input type="number" step="0.01" name="shipping_rate[new][max_weight]" value="999999"></td>
+                        <td><input type="number" step="0.01" name="shipping_rate[new][min_weight]" placeholder="0"></td>
+                        <td><input type="number" step="0.01" name="shipping_rate[new][max_weight]" placeholder="999999"></td>
                         <td><input type="number" step="0.01" name="shipping_rate[new][rate]" value="0"></td>
                         <td><button type="button" class="button add_rate"><?php _e('Add Rate', 'wc-custom-shipping'); ?></button></td>
                     </tr>
                 </tbody>
             </table>
+            <input type="hidden" name="deleted_rates" value="">
 <?php
         }
 
@@ -192,29 +225,40 @@ function wc_custom_shipping_init()
             if (isset($_POST['shipping_rate'])) {
                 $rates = wc_clean($_POST['shipping_rate']);
 
+                // Process deletions first
+                if (isset($_POST['deleted_rates'])) {
+                    $deleted_rates = array_map('intval', explode(',', $_POST['deleted_rates']));
+                    foreach ($deleted_rates as $rate_id) {
+                        $wpdb->delete($table_name, array('id' => $rate_id), array('%d'));
+                    }
+                }
+
+                // Then process updates and additions
                 foreach ($rates as $id => $rate) {
+                    // Skip empty rows
+                    if (empty($rate['country']) && $id !== 'new') {
+                        continue;
+                    }
+
+                    // Normalize and validate the data
+                    $rate_data = array(
+                        'country' => $rate['country'],
+                        'postal_code' => !empty($rate['postal_code']) ? strtoupper(wc_normalize_postcode($rate['postal_code'])) : '*',
+                        'min_weight' => floatval($rate['min_weight']),
+                        'max_weight' => floatval($rate['max_weight']),
+                        'rate' => floatval($rate['rate'])
+                    );
+
                     if ($id === 'new' && !empty($rate['country'])) {
                         $wpdb->insert(
                             $table_name,
-                            array(
-                                'country' => $rate['country'],
-                                'postal_code' => $rate['postal_code'],
-                                'min_weight' => $rate['min_weight'],
-                                'max_weight' => $rate['max_weight'],
-                                'rate' => $rate['rate']
-                            ),
+                            $rate_data,
                             array('%s', '%s', '%f', '%f', '%f')
                         );
                     } elseif (is_numeric($id)) {
                         $wpdb->update(
                             $table_name,
-                            array(
-                                'country' => $rate['country'],
-                                'postal_code' => $rate['postal_code'],
-                                'min_weight' => $rate['min_weight'],
-                                'max_weight' => $rate['max_weight'],
-                                'rate' => $rate['rate']
-                            ),
+                            $rate_data,
                             array('id' => $id),
                             array('%s', '%s', '%f', '%f', '%f'),
                             array('%d')
@@ -231,26 +275,44 @@ function wc_custom_shipping_init()
 
             $weight = 0;
             $country = $package['destination']['country'];
-            $postcode = $package['destination']['postcode'];
+            $postcode = strtoupper(wc_normalize_postcode($package['destination']['postcode']));
 
+            // Calculate total weight
             foreach ($package['contents'] as $item) {
                 if ($item['data']->get_weight()) {
                     $weight += floatval($item['data']->get_weight()) * $item['quantity'];
                 }
             }
 
+            // Debug log
+            error_log("Calculating shipping for: Country: $country, Postcode: $postcode, Weight: $weight");
+
+            // Modified query to first try exact postal code match, then fallback to wildcard
             $rate = $wpdb->get_row($wpdb->prepare(
                 "SELECT * FROM $table_name 
                 WHERE country = %s 
-                AND (postal_code = '*' OR postal_code = %s)
+                AND (
+                    postal_code = %s 
+                    OR postal_code = '*' 
+                    OR postal_code = ''
+                )
                 AND %f >= min_weight 
                 AND %f <= max_weight
+                ORDER BY 
+                    CASE 
+                        WHEN postal_code = %s THEN 1
+                        WHEN postal_code = '*' OR postal_code = '' THEN 2
+                    END
                 LIMIT 1",
                 $country,
                 $postcode,
                 $weight,
-                $weight
+                $weight,
+                $postcode
             ));
+
+            // Debug log
+            error_log("Found rate: " . print_r($rate, true));
 
             if ($rate) {
                 $this->add_rate(array(
@@ -272,5 +334,23 @@ function wc_custom_shipping_init()
     add_filter('woocommerce_shipping_methods', 'add_wc_custom_shipping_method');
 }
 
-// Initialize the plugin
 add_action('plugins_loaded', 'wc_custom_shipping_init');
+
+// Add AJAX handling for rate deletion
+add_action('wp_ajax_delete_shipping_rate', 'handle_delete_shipping_rate');
+function handle_delete_shipping_rate()
+{
+    if (!current_user_can('manage_woocommerce')) {
+        wp_die(-1);
+    }
+
+    $rate_id = isset($_POST['rate_id']) ? absint($_POST['rate_id']) : 0;
+
+    if ($rate_id) {
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'wc_custom_shipping_rates';
+        $wpdb->delete($table_name, array('id' => $rate_id), array('%d'));
+    }
+
+    wp_die();
+}
