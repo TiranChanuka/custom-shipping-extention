@@ -60,12 +60,24 @@ function wc_custom_shipping_activate()
         postal_code varchar(10) NOT NULL,
         min_weight decimal(10,2) NOT NULL,
         max_weight decimal(10,2) NOT NULL,
-        rate decimal(10,2) NOT NULL,
+         standard_fee decimal(10,2) NOT NULL,
+        one_day_fee decimal(10,2) NOT NULL,
         PRIMARY KEY  (id)
     ) $charset_collate;";
 
     require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
     dbDelta($sql);
+
+    // Check if we need to migrate existing data
+    $columns = $wpdb->get_col("SHOW COLUMNS FROM $table_name");
+    if (in_array('rate', $columns)) {
+        // Migrate existing data
+        $wpdb->query("ALTER TABLE $table_name 
+                     ADD COLUMN standard_fee decimal(10,2) NOT NULL DEFAULT 0,
+                     ADD COLUMN one_day_fee decimal(10,2) NOT NULL DEFAULT 0");
+        $wpdb->query("UPDATE $table_name SET standard_fee = rate, one_day_fee = rate * 1.5");
+        $wpdb->query("ALTER TABLE $table_name DROP COLUMN rate");
+    }
 }
 
 register_activation_hook(__FILE__, 'wc_custom_shipping_activate');
@@ -156,7 +168,8 @@ function wc_custom_shipping_init()
                         <th><?php _e('Postal Code', 'wc-custom-shipping'); ?></th>
                         <th><?php _e('Min Weight (kg)', 'wc-custom-shipping'); ?></th>
                         <th><?php _e('Max Weight (kg)', 'wc-custom-shipping'); ?></th>
-                        <th><?php _e('Rate', 'wc-custom-shipping'); ?></th>
+                        <th><?php _e('Standard Fee', 'wc-custom-shipping'); ?></th>
+                        <th><?php _e('One Day Fee', 'wc-custom-shipping'); ?></th>
                         <th></th>
                     </tr>
                 </thead>
@@ -185,8 +198,12 @@ function wc_custom_shipping_init()
                                         value="<?php echo esc_attr($rate['max_weight']); ?>">
                                 </td>
                                 <td>
-                                    <input type="number" step="0.01" name="shipping_rate[<?php echo esc_attr($rate['id']); ?>][rate]"
-                                        value="<?php echo esc_attr($rate['rate']); ?>">
+                                    <input type="number" step="0.01" name="shipping_rate[<?php echo esc_attr($rate['id']); ?>][standard_fee]"
+                                        value="<?php echo esc_attr($rate['standard_fee']); ?>">
+                                </td>
+                                <td>
+                                    <input type="number" step="0.01" name="shipping_rate[<?php echo esc_attr($rate['id']); ?>][one_day_fee]"
+                                        value="<?php echo esc_attr($rate['one_day_fee']); ?>">
                                 </td>
                                 <td>
                                     <button type="button" class="button remove_rate"><?php _e('Remove', 'wc-custom-shipping'); ?></button>
@@ -206,7 +223,8 @@ function wc_custom_shipping_init()
                         <td><input type="text" name="shipping_rate[new][postal_code]" placeholder="* for all"></td>
                         <td><input type="number" step="0.01" name="shipping_rate[new][min_weight]" placeholder="0"></td>
                         <td><input type="number" step="0.01" name="shipping_rate[new][max_weight]" placeholder="999999"></td>
-                        <td><input type="number" step="0.01" name="shipping_rate[new][rate]" value="0"></td>
+                        <td><input type="number" step="0.01" name="shipping_rate[new][standard_fee]" value="0"></td>
+                        <td><input type="number" step="0.01" name="shipping_rate[new][one_day_fee]" value="0"></td>
                         <td><button type="button" class="button add_rate"><?php _e('Add Rate', 'wc-custom-shipping'); ?></button></td>
                     </tr>
                 </tbody>
@@ -214,6 +232,7 @@ function wc_custom_shipping_init()
             <input type="hidden" name="deleted_rates" value="">
 <?php
         }
+
 
         public function process_admin_options()
         {
@@ -246,28 +265,28 @@ function wc_custom_shipping_init()
                         'postal_code' => !empty($rate['postal_code']) ? strtoupper(wc_normalize_postcode($rate['postal_code'])) : '*',
                         'min_weight' => floatval($rate['min_weight']),
                         'max_weight' => floatval($rate['max_weight']),
-                        'rate' => floatval($rate['rate'])
+                        'standard_fee' => floatval($rate['standard_fee']),
+                        'one_day_fee' => floatval($rate['one_day_fee'])
                     );
 
                     if ($id === 'new' && !empty($rate['country'])) {
                         $wpdb->insert(
                             $table_name,
                             $rate_data,
-                            array('%s', '%s', '%f', '%f', '%f')
+                            array('%s', '%s', '%f', '%f', '%f', '%f')
                         );
                     } elseif (is_numeric($id)) {
                         $wpdb->update(
                             $table_name,
                             $rate_data,
                             array('id' => $id),
-                            array('%s', '%s', '%f', '%f', '%f'),
+                            array('%s', '%s', '%f', '%f', '%f', '%f'),
                             array('%d')
                         );
                     }
                 }
             }
         }
-
         public function calculate_shipping($package = array())
         {
             global $wpdb;
@@ -316,9 +335,17 @@ function wc_custom_shipping_init()
 
             if ($rate) {
                 $this->add_rate(array(
-                    'id' => $this->id . $this->instance_id,
-                    'label' => $this->title,
-                    'cost' => $rate->rate,
+                    'id' => $this->id . $this->instance_id . '_standard',
+                    'label' => $this->title . ' - Standard Delivery',
+                    'cost' => $rate->standard_fee,
+                    'calc_tax' => 'per_order'
+                ));
+
+                // Add one day shipping rate
+                $this->add_rate(array(
+                    'id' => $this->id . $this->instance_id . '_one_day',
+                    'label' => $this->title . ' - One Day Delivery',
+                    'cost' => $rate->one_day_fee,
                     'calc_tax' => 'per_order'
                 ));
             }
