@@ -3,7 +3,7 @@
 /**
  * Plugin Name: WooCommerce Custom Shipping
  * Description: Custom shipping rates based on country, postal code and weight
- * Version: 1.0.0
+ * Version: 1.1.0
  * Author: Tiran Chanuka
  * Text Domain: wc-custom-shipping
  */
@@ -22,6 +22,8 @@ function wc_custom_shipping_admin_scripts()
 ?>
         <script type="text/javascript">
             jQuery(document).ready(function($) {
+                var deletedRates = [];
+
                 // Handle Add Rate button
                 $(document).on('click', '.add_rate', function() {
                     var $row = $(this).closest('tr');
@@ -37,13 +39,78 @@ function wc_custom_shipping_admin_scripts()
 
                 // Handle Remove Rate button
                 $(document).on('click', '.remove_rate', function() {
-                    $(this).closest('tr').remove();
+                    var $row = $(this).closest('tr');
+                    var rateId = $row.attr('data-rate-id');
+
+                    if (confirm('Are you sure you want to delete this shipping rate? This action cannot be undone.')) {
+                        if (rateId) {
+                            // AJAX call to delete from database
+                            $.ajax({
+                                url: ajaxurl,
+                                type: 'POST',
+                                data: {
+                                    action: 'delete_shipping_rate',
+                                    rate_id: rateId,
+                                    nonce: wc_custom_shipping.nonce
+                                },
+                                success: function(response) {
+                                    if (response.success) {
+                                        // Add to deleted rates array and update hidden input
+                                        deletedRates.push(rateId);
+                                        $('#deleted_rates').val(deletedRates.join(','));
+
+                                        // Remove row from table
+                                        $row.fadeOut(400, function() {
+                                            $(this).remove();
+                                        });
+
+                                        // Show success message
+                                        alert('Shipping rate deleted successfully!');
+                                    } else {
+                                        alert('Error deleting shipping rate. Please try again.');
+                                    }
+                                },
+                                error: function() {
+                                    alert('Error deleting shipping rate. Please try again.');
+                                }
+                            });
+                        } else {
+                            // For new unsaved rows, just remove from DOM
+                            $row.fadeOut(400, function() {
+                                $(this).remove();
+                            });
+                        }
+                    }
+                });
+
+                // Debug: Log when form is submitted
+                $('form#mainform').on('submit', function() {
+                    console.log('Form submitted. Deleted rates:', $('#deleted_rates').val());
                 });
             });
+        </script>
+    <?php
+    }
+}
+// Add nonce for security
+function wc_custom_shipping_admin_footer()
+{
+    if (
+        isset($_GET['page']) && $_GET['page'] === 'wc-settings'
+        && isset($_GET['tab']) && $_GET['tab'] === 'shipping'
+    ) {
+        $nonce = wp_create_nonce('wc_custom_shipping_delete');
+    ?>
+        <script type="text/javascript">
+            var wc_custom_shipping = {
+                nonce: '<?php echo esc_js($nonce); ?>'
+            };
         </script>
         <?php
     }
 }
+add_action('admin_footer', 'wc_custom_shipping_admin_footer');
+
 add_action('admin_footer', 'wc_custom_shipping_admin_scripts');
 
 // Activation function
@@ -161,6 +228,7 @@ function wc_custom_shipping_init()
             $rates = $wpdb->get_results("SELECT * FROM $table_name ORDER BY id ASC", ARRAY_A);
         ?>
             <h3><?php _e('Shipping Rates', 'wc-custom-shipping'); ?></h3>
+            <input type="hidden" id="deleted_rates" name="deleted_rates" value="">
             <table class="widefat" id="shipping_rates_table">
                 <thead>
                     <tr>
@@ -175,7 +243,7 @@ function wc_custom_shipping_init()
                 </thead>
                 <tbody>
                     <?php if ($rates) : foreach ($rates as $rate) : ?>
-                            <tr>
+                            <tr data-rate-id="<?php echo esc_attr($rate['id']); ?>">
                                 <td>
                                     <select name="shipping_rate[<?php echo esc_attr($rate['id']); ?>][country]">
                                         <?php foreach (WC()->countries->get_countries() as $code => $name) : ?>
@@ -241,25 +309,26 @@ function wc_custom_shipping_init()
             global $wpdb;
             $table_name = $wpdb->prefix . 'wc_custom_shipping_rates';
 
-            if (isset($_POST['shipping_rate'])) {
-                $rates = wc_clean($_POST['shipping_rate']);
-
-                // Process deletions first
-                if (isset($_POST['deleted_rates'])) {
-                    $deleted_rates = array_map('intval', explode(',', $_POST['deleted_rates']));
+            // Process deletions first
+            if (!empty($_POST['deleted_rates'])) {
+                $deleted_rates = array_filter(array_map('intval', explode(',', $_POST['deleted_rates'])));
+                if (!empty($deleted_rates)) {
+                    error_log('Deleting rates: ' . print_r($deleted_rates, true)); // Debug log
                     foreach ($deleted_rates as $rate_id) {
                         $wpdb->delete($table_name, array('id' => $rate_id), array('%d'));
                     }
                 }
+            }
 
-                // Then process updates and additions
+            // Process updates and additions
+            if (isset($_POST['shipping_rate'])) {
+                $rates = wc_clean($_POST['shipping_rate']);
+
                 foreach ($rates as $id => $rate) {
-                    // Skip empty rows
                     if (empty($rate['country']) && $id !== 'new') {
                         continue;
                     }
 
-                    // Normalize and validate the data
                     $rate_data = array(
                         'country' => $rate['country'],
                         'postal_code' => !empty($rate['postal_code']) ? strtoupper(wc_normalize_postcode($rate['postal_code'])) : '*',
@@ -344,7 +413,7 @@ function wc_custom_shipping_init()
                 // Add one day shipping rate
                 $this->add_rate(array(
                     'id' => $this->id . $this->instance_id . '_one_day',
-                    'label' => $this->title . ' - One Day Delivery',
+                    'label' => $this->title . ' - Express Delivery (Within One Day)',
                     'cost' => $rate->one_day_fee,
                     'calc_tax' => 'per_order'
                 ));
@@ -365,10 +434,13 @@ add_action('plugins_loaded', 'wc_custom_shipping_init');
 
 // Add AJAX handling for rate deletion
 add_action('wp_ajax_delete_shipping_rate', 'handle_delete_shipping_rate');
+
 function handle_delete_shipping_rate()
 {
-    if (!current_user_can('manage_woocommerce')) {
-        wp_die(-1);
+    // Check nonce and capabilities
+    if (!check_ajax_referer('wc_custom_shipping_delete', 'nonce', false) || !current_user_can('manage_woocommerce')) {
+        wp_send_json_error('Unauthorized access');
+        return;
     }
 
     $rate_id = isset($_POST['rate_id']) ? absint($_POST['rate_id']) : 0;
@@ -376,8 +448,21 @@ function handle_delete_shipping_rate()
     if ($rate_id) {
         global $wpdb;
         $table_name = $wpdb->prefix . 'wc_custom_shipping_rates';
-        $wpdb->delete($table_name, array('id' => $rate_id), array('%d'));
-    }
+        $result = $wpdb->delete($table_name, array('id' => $rate_id), array('%d'));
 
-    wp_die();
+        if ($result !== false) {
+            wp_send_json_success(array(
+                'message' => 'Rate deleted successfully'
+            ));
+        } else {
+            wp_send_json_error(array(
+                'message' => 'Database error occurred'
+            ));
+        }
+    } else {
+        wp_send_json_error(array(
+            'message' => 'Invalid rate ID'
+        ));
+    }
 }
+// add_action('wp_ajax_delete_shipping_rate', 'handle_delete_shipping_rate');
